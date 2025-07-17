@@ -1,0 +1,4 @@
+discord.py[voice]==2.3.2   # PyNaCl pulled automatically
+aiohttp==3.9.5
+requests==2.31.0
+python-dotenv==1.0.1
