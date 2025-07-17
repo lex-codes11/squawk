@@ -1,5 +1,8 @@
-# tts.py
-"""ElevenLabs TTS helper – returns a temp MP3 file path."""
+# tts.py  –  fully replace the old file
+"""
+ElevenLabs Text‑to‑Speech helper.
+Returns the path of a temporary MP3 file containing the spoken text.
+"""
 
 from __future__ import annotations
 
@@ -7,25 +10,43 @@ import os
 import tempfile
 import requests
 
-from config import ELEVEN_KEY, VOICE_ID
+from config import ELEVEN_KEY, VOICE_ID  # make sure these are in .env
 
-API_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+API_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream"
 
-HEADERS = {
-    "xi-api-key": ELEVEN_KEY,          # <‑‑ single, always‑valid header
-    "Content-Type": "application/json",
-    "Accept": "audio/mpeg",
+HEADERS = {              # <- all‑lowercase header spelling is critical
+    "xi-api-key": ELEVEN_KEY,
+    "content-type": "application/json",
+    "accept": "audio/mpeg",
+}
+
+PAYLOAD_TEMPLATE = {
+    "model_id": "eleven_multilingual_v2",
+    # add any voice_settings you like here
 }
 
 
 def synthesize(text: str) -> str:
-    """Convert text → MP3; return the temp file path."""
-    payload = {"text": text, "model_id": "eleven_multilingual_v2"}
-    r = requests.post(API_URL, json=payload, headers=HEADERS, stream=True, timeout=60)
-    r.raise_for_status()
+    """
+    Convert *text* to speech with ElevenLabs and return a temp‑file path.
+    Raises `requests.HTTPError` if ElevenLabs responds with a non‑200 status.
+    """
+    data = PAYLOAD_TEMPLATE | {"text": text}
+    # optimise latency so audio starts almost immediately
+    params = {"optimize_streaming_latency": 1}
+
+    r = requests.post(
+        API_URL,
+        headers=HEADERS,
+        params=params,
+        json=data,
+        stream=True,
+        timeout=60,
+    )
+    r.raise_for_status()                 # ⇦ will only raise if truly unauthorised
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    for chunk in r.iter_content(1024):
+    for chunk in r.iter_content(8192):
         tmp.write(chunk)
     tmp.close()
     return tmp.name
