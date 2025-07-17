@@ -1,9 +1,13 @@
+# news_fetcher.py
 """Poll NewsAPI every POLL_SEC seconds and push new headlines into a queue."""
+
+from __future__ import annotations
 
 import asyncio
 import hashlib
-import http.client
-from aiohttp import ClientSession
+from typing import Set
+
+from aiohttp import ClientSession, ClientTimeout
 from config import NEWSAPI_KEY, POLL_SEC
 
 NEWS_ENDPOINT = (
@@ -12,9 +16,11 @@ NEWS_ENDPOINT = (
 
 
 async def fetch_news_loop(queue: asyncio.Queue):
-    seen: set[str] = set()
+    """Continuously fetch headlines and put unseen ones into the queue."""
+    seen: Set[str] = set()
+    timeout = ClientTimeout(total=10)
 
-    async with ClientSession(timeout=http.client.Timeout(total=10)) as session:
+    async with ClientSession(timeout=timeout) as session:
         while True:
             try:
                 headers = {"X-Api-Key": NEWSAPI_KEY}
