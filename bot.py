@@ -1,11 +1,13 @@
-# bot.py
+# bot.py ────────────────────────────────────────────────────────────────
 """Discord bot that announces news headlines in a voice channel."""
 
 from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from datetime import datetime, timezone
+from multiprocessing.connection import Listener
 
 import discord
 from discord.ext import commands
@@ -15,13 +17,12 @@ from config import (
     GUILD_ID,
     VOICE_CHANNEL_ID,
     TEXT_CHANNEL_ID,
+    QUEUE_SOCK,          # add to .env → QUEUE_SOCK=/tmp/squawk.sock  (or leave unset for default)
 )
 from news_fetcher import fetch_news_loop
 from tts import synthesize
 
-# --------------------------------------------------------------------------- #
-#  Discord setup
-# --------------------------------------------------------------------------- #
+# ────────────────── discord setup ──────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -31,11 +32,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 news_queue: asyncio.Queue = asyncio.Queue()
 
 
-# --------------------------------------------------------------------------- #
-#  Helpers
-# --------------------------------------------------------------------------- #
+# ────────────────── helper functions ───────────────────────────────────
 def spell(word: str) -> str:
-    """Spell stock tickers (e.g. NVDA → N‑V‑D‑A) for clearer TTS."""
+    """Spell tickers (NVDA ➜ N‑V‑D‑A)."""
     if word.isalpha() and word.isupper() and len(word) <= 5:
         return "-".join(word)
     return word
@@ -47,11 +46,10 @@ def to_ssml(title: str) -> str:
 
 
 async def connect_voice() -> discord.VoiceProtocol | None:
-    """Join the configured voice/stage channel and unsuppress the bot."""
+    """Join (or retrieve) the configured voice channel and ensure we can speak."""
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         return None
-
     channel = guild.get_channel(VOICE_CHANNEL_ID)
     if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
         return None
@@ -64,18 +62,44 @@ async def connect_voice() -> discord.VoiceProtocol | None:
     if not vc:
         return None
 
-    # Ensure the bot is unsuppressed (works for both Voice & Stage)
+    # Allow speaking even in Stage channels
     try:
-        await vc.channel.edit(suppress=False)
-    except discord.HTTPException:
+        await vc.guild.change_voice_state(channel=vc.channel, suppressed=False)
+    except (discord.HTTPException, AttributeError):
         pass
-
     return vc
 
 
-# --------------------------------------------------------------------------- #
-#  Events
-# --------------------------------------------------------------------------- #
+# ────────────────── background socket to enqueue headlines ─────────────
+def _queue_socket_listener(q: asyncio.Queue):
+    """Local UNIX socket listener – lets docker exec enqueue headlines without re‑importing bot.py."""
+    socket_path = QUEUE_SOCK or "/tmp/squawk.sock"
+    if os.path.exists(socket_path):
+        os.remove(socket_path)
+    listener = Listener(socket_path)  # multiprocessing.connection.Listener (AF_UNIX)
+
+    print(f"[helper‑sock] listening on {socket_path!s}")
+    while True:
+        try:
+            conn = listener.accept()
+            title = conn.recv()        # we expect a simple str
+            asyncio.run_coroutine_threadsafe(
+                q.put({"title": title}),
+                bot.loop,
+            )
+            conn.close()
+        except Exception as e:
+            print("[helper‑sock] error:", e)
+
+
+threading.Thread(
+    target=_queue_socket_listener,
+    args=(news_queue,),
+    daemon=True,
+).start()
+
+
+# ────────────────── discord events ─────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
@@ -86,10 +110,9 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
-    """Kick listeners who lack the News‑Pro role."""
+    """Kick listeners without the News‑Pro role."""
     if member.bot:
         return
-
     channel = bot.get_channel(VOICE_CHANNEL_ID)
     if after.channel == channel and not any(r.name == "News-Pro" for r in member.roles):
         try:
@@ -99,16 +122,13 @@ async def on_voice_state_update(member: discord.Member, before, after):
             pass
 
 
-# --------------------------------------------------------------------------- #
-#  Background task
-# --------------------------------------------------------------------------- #
+# ────────────────── headline consumer ──────────────────────────────────
 async def consume_news():
     text_chan = bot.get_channel(TEXT_CHANNEL_ID)
-
     while True:
         item = await news_queue.get()
 
-        # ----- send embed -----
+        # ----- embed ----------------------------------------------------
         title = item["title"]
         url = item.get("url")
         pub_str = item.get("published") or ""
@@ -122,7 +142,7 @@ async def consume_news():
             embed.set_footer(text="NewsAPI.org")
             await text_chan.send(embed=embed)
 
-        # ----- speak headline -----
+        # ----- TTS ------------------------------------------------------
         ssml = to_ssml(title)
         path = await bot.loop.run_in_executor(None, synthesize, ssml)
 
@@ -133,7 +153,7 @@ async def consume_news():
         if voice and not voice.is_playing():
             audio = discord.FFmpegPCMAudio(path)
 
-            def _cleanup(_: object):
+            def _cleanup(_):
                 try:
                     os.remove(path)
                 except OSError:
@@ -144,15 +164,12 @@ async def consume_news():
             os.remove(path)
 
 
-# --------------------------------------------------------------------------- #
-#  Slash command
-# --------------------------------------------------------------------------- #
-@bot.tree.command(name="ping")
+# ────────────────── simple slash‑command ‐ ping ------------------------
+@bot.tree.command(name="ping", description="Check bot responsiveness")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong")
 
 
-# --------------------------------------------------------------------------- #
-#  Run the bot
-# --------------------------------------------------------------------------- #
-bot.run(DISCORD_TOKEN)
+# ────────────────── bot entry‑point ────────────────────────────────────
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
