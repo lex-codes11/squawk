@@ -1,52 +1,63 @@
-# tts.py  –  fully replace the old file
-"""
-ElevenLabs Text‑to‑Speech helper.
-Returns the path of a temporary MP3 file containing the spoken text.
+# tts.py
+"""ElevenLabs text‑to‑speech helper.
+
+Given some text (or SSML) it returns the path to a temporary
+MP3 file that contains the spoken audio.  The file is created
+with `tempfile.NamedTemporaryFile(delete=False)` so **you** are
+responsible for deleting it once the Discord player is finished.
 """
 
 from __future__ import annotations
 
 import os
 import tempfile
+from typing import Final
+
 import requests
 
-from config import ELEVEN_KEY, VOICE_ID  # make sure these are in .env
+from config import ELEVEN_KEY, VOICE_ID  # e.g. VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 
-API_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream"
-
-HEADERS = {              # <- all‑lowercase header spelling is critical
-    "xi-api-key": ELEVEN_KEY,
-    "content-type": "application/json",
-    "accept": "audio/mpeg",
+# --------------------------------------------------------------------------- #
+API_URL: Final[str] = (
+    f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream"
+)
+HEADERS: Final[dict[str, str]] = {
+    "xi-api-key": ELEVEN_KEY,      # your validated key (works w/ free tier)
+    "Content-Type": "application/json",
+    "Accept": "audio/mpeg",
 }
-
-PAYLOAD_TEMPLATE = {
+BODY_TMPL: Final[dict[str, object]] = {
     "model_id": "eleven_multilingual_v2",
-    # add any voice_settings you like here
+    # "voice_settings": { ... }  # optional
 }
 
 
-def synthesize(text: str) -> str:
+def synthesize(text_or_ssml: str) -> str:
     """
-    Convert *text* to speech with ElevenLabs and return a temp‑file path.
-    Raises `requests.HTTPError` if ElevenLabs responds with a non‑200 status.
+    Convert *text_or_ssml* into speech.
+
+    Returns
+    -------
+    str
+        Absolute path to a freshly‑written `.mp3` file.
+    Raises
+    ------
+    requests.HTTPError
+        If ElevenLabs responds with a non‑200 status
+        (e.g. 401 when the API key is wrong or revoked).
     """
-    data = PAYLOAD_TEMPLATE | {"text": text}
-    # optimise latency so audio starts almost immediately
-    params = {"optimize_streaming_latency": 1}
+    payload = BODY_TMPL | {"text": text_or_ssml}
 
-    r = requests.post(
-        API_URL,
-        headers=HEADERS,
-        params=params,
-        json=data,
-        stream=True,
-        timeout=60,
-    )
-    r.raise_for_status()                 # ⇦ will only raise if truly unauthorised
+    # Stream the audio directly into a temporary file to avoid
+    # loading the whole thing into memory.
+    with requests.post(
+        API_URL, headers=HEADERS, json=payload, stream=True, timeout=30
+    ) as resp:
+        resp.raise_for_status()  # will raise if the key/voice is invalid
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    for chunk in r.iter_content(8192):
-        tmp.write(chunk)
-    tmp.close()
-    return tmp.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:  # filter out keep‑alive chunks
+                    tmp.write(chunk)
+
+            return tmp.name
