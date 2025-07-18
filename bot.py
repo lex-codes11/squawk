@@ -1,11 +1,9 @@
-# bot.py ────────────────────────────────────────────────────────────────
 """Discord bot that announces news headlines in a voice channel."""
 
 from __future__ import annotations
 
 import asyncio
 import os
-import threading
 from datetime import datetime, timezone
 from multiprocessing.connection import Listener
 
@@ -17,12 +15,11 @@ from config import (
     GUILD_ID,
     VOICE_CHANNEL_ID,
     TEXT_CHANNEL_ID,
-    QUEUE_SOCK,          # add to .env → QUEUE_SOCK=/tmp/squawk.sock  (or leave unset for default)
+    QUEUE_SOCK,
 )
 from news_fetcher import fetch_news_loop
 from tts import synthesize
 
-# ────────────────── discord setup ──────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -32,9 +29,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 news_queue: asyncio.Queue = asyncio.Queue()
 
 
-# ────────────────── helper functions ───────────────────────────────────
+# ───────────────────────── helpers ──────────────────────────
 def spell(word: str) -> str:
-    """Spell tickers (NVDA ➜ N‑V‑D‑A)."""
+    """Spell tickers (NVDA → N‑V‑D‑A)."""
     if word.isalpha() and word.isupper() and len(word) <= 5:
         return "-".join(word)
     return word
@@ -46,14 +43,16 @@ def to_ssml(title: str) -> str:
 
 
 async def connect_voice() -> discord.VoiceProtocol | None:
-    """Join (or retrieve) the configured voice channel and ensure we can speak."""
+    """Ensure the bot is connected and unsuppressed in the target channel."""
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         return None
+
     channel = guild.get_channel(VOICE_CHANNEL_ID)
     if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
         return None
 
+    # Connect (or re‑use existing)
     try:
         vc: discord.VoiceProtocol = await channel.connect()
     except discord.ClientException:
@@ -62,57 +61,32 @@ async def connect_voice() -> discord.VoiceProtocol | None:
     if not vc:
         return None
 
-    # Allow speaking even in Stage channels
+    # Unsuppress so audio is audible (works for Stage & Voice)
     try:
-        await vc.guild.change_voice_state(channel=vc.channel, suppressed=False)
-    except (discord.HTTPException, AttributeError):
+        await vc.guild.change_voice_state(channel=vc.channel, suppress=False)
+    except discord.HTTPException:
         pass
     return vc
 
 
-# ────────────────── background socket to enqueue headlines ─────────────
-def _queue_socket_listener(q: asyncio.Queue):
-    """Local UNIX socket listener – lets docker exec enqueue headlines without re‑importing bot.py."""
-    socket_path = QUEUE_SOCK or "/tmp/squawk.sock"
-    if os.path.exists(socket_path):
-        os.remove(socket_path)
-    listener = Listener(socket_path)  # multiprocessing.connection.Listener (AF_UNIX)
-
-    print(f"[helper‑sock] listening on {socket_path!s}")
-    while True:
-        try:
-            conn = listener.accept()
-            title = conn.recv()        # we expect a simple str
-            asyncio.run_coroutine_threadsafe(
-                q.put({"title": title}),
-                bot.loop,
-            )
-            conn.close()
-        except Exception as e:
-            print("[helper‑sock] error:", e)
-
-
-threading.Thread(
-    target=_queue_socket_listener,
-    args=(news_queue,),
-    daemon=True,
-).start()
-
-
-# ────────────────── discord events ─────────────────────────────────────
+# ───────────────────────── events ───────────────────────────
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     await connect_voice()
+
+    # start background jobs
     bot.loop.create_task(fetch_news_loop(news_queue))
     bot.loop.create_task(consume_news())
+    bot.loop.create_task(listen_local_socket())  # for enqueue.py helper
 
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
-    """Kick listeners without the News‑Pro role."""
+    """Boot listeners without the News‑Pro role."""
     if member.bot:
         return
+
     channel = bot.get_channel(VOICE_CHANNEL_ID)
     if after.channel == channel and not any(r.name == "News-Pro" for r in member.roles):
         try:
@@ -122,16 +96,17 @@ async def on_voice_state_update(member: discord.Member, before, after):
             pass
 
 
-# ────────────────── headline consumer ──────────────────────────────────
+# ─────────────────── background tasks ───────────────────────
 async def consume_news():
     text_chan = bot.get_channel(TEXT_CHANNEL_ID)
+
     while True:
         item = await news_queue.get()
-
-        # ----- embed ----------------------------------------------------
         title = item["title"]
         url = item.get("url")
         pub_str = item.get("published") or ""
+
+        # embed
         try:
             ts = datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
         except ValueError:
@@ -142,7 +117,7 @@ async def consume_news():
             embed.set_footer(text="NewsAPI.org")
             await text_chan.send(embed=embed)
 
-        # ----- TTS ------------------------------------------------------
+        # voice
         ssml = to_ssml(title)
         path = await bot.loop.run_in_executor(None, synthesize, ssml)
 
@@ -164,12 +139,30 @@ async def consume_news():
             os.remove(path)
 
 
-# ────────────────── simple slash‑command ‐ ping ------------------------
-@bot.tree.command(name="ping", description="Check bot responsiveness")
+async def listen_local_socket():
+    """Allow `enqueue.py "headline"` to inject items without restarting."""
+    loop = asyncio.get_running_loop()
+
+    if os.path.exists(QUEUE_SOCK):
+        os.remove(QUEUE_SOCK)
+
+    listener = Listener(QUEUE_SOCK)
+    listener._listener.setblocking(False)  # type: ignore
+
+    while True:
+        try:
+            conn = await loop.run_in_executor(None, listener.accept)
+            msg = await loop.run_in_executor(None, conn.recv)
+            await news_queue.put({"title": str(msg)})
+            conn.close()
+        except Exception:
+            await asyncio.sleep(0.5)
+
+
+# ──────────────────── slash command ─────────────────────────
+@bot.tree.command(name="ping")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong")
 
 
-# ────────────────── bot entry‑point ────────────────────────────────────
-if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+bot.run(DISCORD_TOKEN)
